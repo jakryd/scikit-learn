@@ -7,6 +7,7 @@ cluster extraction methods of the ordered list.
 # Authors: The scikit-learn developers
 # SPDX-License-Identifier: BSD-3-Clause
 
+import heapq
 import warnings
 from numbers import Integral, Real
 
@@ -48,8 +49,11 @@ class OPTICS(ClusterMixin, BaseEstimator):
     all points (instead of computing neighbors while looping through points).
     Reachability distances to only unprocessed points are then computed, to
     construct the cluster order, similar to the original OPTICS.
-    Note that we do not employ a heap to manage the expansion
-    candidates, so the time complexity will be O(n^2).
+    Expansion candidates are managed with a binary heap (``heapq``), giving
+    seed selection ``O(log n)`` per step. With a finite ``max_eps``, the radius
+    neighborhood graph is computed once with the overall run time being close to
+    ``O(n log n)``. The default ``max_eps=np.inf`` still requires reachability
+    distances to every other point, so it remains ``O(n^2)``.
 
     Read more in the :ref:`User Guide <optics>`.
 
@@ -632,32 +636,81 @@ def compute_optics_graph(
 
     # Main OPTICS loop. Not parallelizable. The order that entries are
     # written to the 'ordering_' list is important!
-    # Note that this implementation is O(n^2) theoretically, but
-    # supposedly with very low constant factors.
-    processed = np.zeros(X.shape[0], dtype=bool)
-    ordering = np.zeros(X.shape[0], dtype=int)
-    for ordering_idx in range(X.shape[0]):
-        # Choose next based on smallest reachability distance
-        # (And prefer smaller ids on ties, possibly np.inf!)
-        index = np.where(processed == 0)[0]
-        point = index[np.argmin(reachability_[index])]
+    processed = np.zeros(n_samples, dtype=bool)
+    ordering = np.zeros(n_samples, dtype=int)
 
-        processed[point] = True
-        ordering[ordering_idx] = point
-        if core_distances_[point] != np.inf:
-            _set_reach_dist(
-                core_distances_=core_distances_,
-                reachability_=reachability_,
-                predecessor_=predecessor_,
-                point_index=point,
-                processed=processed,
-                X=X,
-                nbrs=nbrs,
-                metric=metric,
-                metric_params=metric_params,
-                p=p,
-                max_eps=max_eps,
-            )
+    if not np.isfinite(max_eps):
+        # max_eps=inf: The original vectorized linear-scan selection and
+        # per-point neighbor queries.
+        for ordering_idx in range(n_samples):
+            # Choose next based on smallest reachability distance
+            # (And prefer smaller ids on ties, possibly np.inf!)
+            index = np.where(processed == 0)[0]
+            point = index[np.argmin(reachability_[index])]
+            processed[point] = True
+            ordering[ordering_idx] = point
+            if core_distances_[point] != np.inf:
+                _set_reach_dist(
+                    core_distances_=core_distances_,
+                    reachability_=reachability_,
+                    predecessor_=predecessor_,
+                    point_index=point,
+                    processed=processed,
+                    X=X,
+                    nbrs=nbrs,
+                    nbrs_graph=None,
+                    heap=None,
+                    metric=metric,
+                    metric_params=metric_params,
+                    p=p,
+                    max_eps=max_eps,
+                )
+    else:
+        # For a finite ``max_eps``, compute the radius neighborhood graph once
+        # (each distance computed a single time) and read its rows in the loop,
+        # and select the next point with a binary-heap priority queue keyed by
+        # (reachability, index), which gives O(log n) per step instead of an
+        # O(n) scan.
+        # The heap has no decrease-key, i.e., when a point's reachability
+        # improves, a new entry is pushed and stale entries are skipped on pop.
+        nbrs_graph = nbrs.radius_neighbors_graph(
+            X, radius=max_eps, mode="distance"
+        ).tocsr()
+        ordering_idx = 0
+        heap = []
+        for start in range(n_samples):
+            if processed[start]:
+                continue
+
+            # Fresh seed: reachability is (still) inf, so it sorts after every
+            # finite candidate and is picked by smallest index.
+            heapq.heappush(heap, (reachability_[start], start))
+            while heap:
+                rdist, point = heapq.heappop(heap)
+                if processed[point] and rdist > reachability_[point]:
+                    continue
+
+                processed[point] = True
+                ordering[ordering_idx] = point
+                ordering_idx += 1
+
+                if core_distances_[point] != np.inf:
+                    _set_reach_dist(
+                        core_distances_=core_distances_,
+                        reachability_=reachability_,
+                        predecessor_=predecessor_,
+                        point_index=point,
+                        processed=processed,
+                        X=X,
+                        nbrs=nbrs,
+                        nbrs_graph=nbrs_graph,
+                        heap=heap,
+                        metric=metric,
+                        metric_params=metric_params,
+                        p=p,
+                        max_eps=max_eps,
+                    )
+
     if np.all(np.isinf(reachability_)):
         warnings.warn(
             (
@@ -677,42 +730,64 @@ def _set_reach_dist(
     processed,
     X,
     nbrs,
+    nbrs_graph,
+    heap,
     metric,
     metric_params,
     p,
     max_eps,
 ):
-    P = X[point_index : point_index + 1]
-    # Assume that radius_neighbors is faster without distances
-    # and we don't need all distances, nevertheless, this means
-    # we may be doing some work twice.
-    indices = nbrs.radius_neighbors(P, radius=max_eps, return_distance=False)[0]
-
-    # Getting indices of neighbors that have not been processed
-    unproc = np.compress(~np.take(processed, indices), indices)
-    # Neighbors of current point are already processed.
-    if not unproc.size:
-        return
-
-    # Only compute distances to unprocessed neighbors:
-    if metric == "precomputed":
-        dists = X[[point_index], unproc]
-        if isinstance(dists, np.matrix):
-            dists = np.asarray(dists)
-        dists = dists.ravel()
+    if nbrs_graph is not None:
+        # Finite max_eps: read the precomputed radius neighborhood graph row,
+        # so each distance is computed once (when the graph was built).
+        lo, hi = nbrs_graph.indptr[point_index], nbrs_graph.indptr[point_index + 1]
+        indices = nbrs_graph.indices[lo:hi]
+        keep = ~np.take(processed, indices)
+        # Neighbors of current point are already processed.
+        if not keep.any():
+            return
+        unproc = indices[keep]
+        dists = nbrs_graph.data[lo:hi][keep]
     else:
-        _params = dict() if metric_params is None else metric_params.copy()
-        if metric == "minkowski" and "p" not in _params:
-            # the same logic as neighbors, p is ignored if explicitly set
-            # in the dict params
-            _params["p"] = p
-        dists = pairwise_distances(P, X[unproc], metric, n_jobs=None, **_params).ravel()
+        P = X[point_index : point_index + 1]
+        # Assume that radius_neighbors is faster without distances
+        # and we don't need all distances, nevertheless, this means
+        # we may be doing some work twice.
+        indices = nbrs.radius_neighbors(P, radius=max_eps, return_distance=False)[0]
+
+        # Getting indices of neighbors that have not been processed
+        unproc = np.compress(~np.take(processed, indices), indices)
+        # Neighbors of current point are already processed.
+        if not unproc.size:
+            return
+
+        # Only compute distances to unprocessed neighbors:
+        if metric == "precomputed":
+            dists = X[[point_index], unproc]
+            if isinstance(dists, np.matrix):
+                dists = np.asarray(dists)
+            dists = dists.ravel()
+        else:
+            _params = dict() if metric_params is None else metric_params.copy()
+            if metric == "minkowski" and "p" not in _params:
+                # the same logic as neighbors, p is ignored if explicitly set
+                # in the dict params
+                _params["p"] = p
+            dists = pairwise_distances(
+                P, X[unproc], metric, n_jobs=None, **_params
+            ).ravel()
 
     rdists = np.maximum(dists, core_distances_[point_index])
     np.around(rdists, decimals=np.finfo(rdists.dtype).precision, out=rdists)
-    improved = np.where(rdists < np.take(reachability_, unproc))
+    improved = np.where(rdists < np.take(reachability_, unproc))  # [0]
     reachability_[unproc[improved]] = rdists[improved]
     predecessor_[unproc[improved]] = point_index
+    if heap is not None:
+        # Push the points whose reachability improved so the heap can pick the
+        # next expansion candidate.
+        # Stale entries are filtered out on pop.
+        for i in improved:
+            heapq.heappush(heap, (rdists[i], int(unproc[i])))
 
 
 @validate_params(
