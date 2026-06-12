@@ -779,7 +779,7 @@ def _set_reach_dist(
 
     rdists = np.maximum(dists, core_distances_[point_index])
     np.around(rdists, decimals=np.finfo(rdists.dtype).precision, out=rdists)
-    improved = np.where(rdists < np.take(reachability_, unproc))  # [0]
+    improved = np.where(rdists < np.take(reachability_, unproc))[0]
     reachability_[unproc[improved]] = rdists[improved]
     predecessor_[unproc[improved]] = point_index
     if heap is not None:
